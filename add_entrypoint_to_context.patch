@@ -1,0 +1,13 @@
+--- a/internal/docker/build.go
++++ b/internal/docker/build.go
+@@ -370,6 +370,10 @@ func createBuildContext(opts *BuildImageOptions) (io.Reader, error) {
+ 		return nil, fmt.Errorf("failed to add function code to tar: %w", err)
+ 	}
+ 
++	// Add docker-entrypoint.sh for all runtimes
++	if err := addFileToTar(tw, "docker-entrypoint.sh", nodeEntrypointScript); err != nil {
++		return nil, fmt.Errorf("failed to add entrypoint script to tar: %w", err)
++	}
++
+ 	// Generate appropriate Dockerfile
+ 	dockerfileContent, err := generateDockerfile(opts)

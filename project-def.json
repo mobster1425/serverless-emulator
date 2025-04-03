@@ -1,0 +1,54 @@
+{
+    "name": "serverless-function-builder",
+    "description": "Builds Docker images for serverless functions on x86_64 architecture",
+    "source": {
+        "type": "S3",
+        "location": "serverless-emulator/codebuild/source/source.zip"
+    },
+    "artifacts": {
+        "type": "NO_ARTIFACTS"
+    },
+    "environment": {
+        "type": "LINUX_CONTAINER",
+        "image": "aws/codebuild/amazonlinux2-x86_64-standard:4.0",
+        "computeType": "BUILD_GENERAL1_SMALL",
+        "privilegedMode": true,
+        "environmentVariables": [
+            {
+                "name": "AWS_DEFAULT_REGION",
+                "value": "us-east-1",
+                "type": "PLAINTEXT"
+            },
+            {
+                "name": "AWS_ACCOUNT_ID",
+                "value": "113491453062",
+                "type": "PLAINTEXT"
+            },
+            {
+                "name": "DOCKER_BUILDKIT",
+                "value": "1",
+                "type": "PLAINTEXT"
+            },
+            {
+                "name": "DOCKER_DEFAULT_PLATFORM", 
+                "value": "linux/amd64",
+                "type": "PLAINTEXT"
+            }
+        ]
+    },
+    "serviceRole": "arn:aws:iam::113491453062:role/codebuild-serverless-function-builder-service-role",
+    "timeoutInMinutes": 30,
+    "queuedTimeoutInMinutes": 480,
+    "encryptionKey": "arn:aws:kms:us-east-1:113491453062:alias/aws/s3",
+    "logsConfig": {
+        "cloudWatchLogs": {
+            "status": "ENABLED",
+            "groupName": "/aws/codebuild/serverless-function-builder",
+            "streamName": "serverless-function-builder"
+        },
+        "s3Logs": {
+            "status": "ENABLED",
+            "location": "serverless-emulator/codebuild/logs/serverless-function-builder"
+        }
+    }
+}

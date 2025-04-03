@@ -1,0 +1,756 @@
+package docker
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+	"time"
+
+	"serverless-emulator/internal/models"
+	//"serverless-emulator/internal/storage"
+	"archive/zip"
+
+	"github.com/docker/docker/api/types"
+	//"github.com/docker/docker/api/types/registry"
+)
+
+// dockerfile templates for different runtimes
+const (
+	nodeDockerfileTemplate = `FROM --platform=linux/amd64 node:18-alpine
+
+# Set TARGETARCH for multi-architecture build
+ARG TARGETARCH=amd64
+
+# Create app directory
+WORKDIR /app
+
+# Copy function code
+COPY . .
+
+# Install production dependencies
+RUN if [ -f package.json ]; then \
+    npm install --production; \
+    fi
+
+# Set environment variables
+ENV NODE_ENV=production
+ENV FUNCTION_HANDLER={{.Handler}}
+
+# Set execute permissions on the runner script
+RUN chmod +x runner.js
+
+# Run the function with explicit architecture compatibility
+CMD ["node", "runner.js"]`
+
+	pythonDockerfileTemplate = `FROM --platform=linux/amd64 {{.BaseImage}}
+
+# Set TARGETARCH for multi-architecture build
+ARG TARGETARCH=amd64
+
+# Create app directory
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    python3-dev \
+    build-base
+
+# Copy function code and dependencies
+COPY . .
+
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+{{range .PreInstall}}
+RUN {{.}}
+{{end}}
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    FUNCTION_HANDLER={{.Handler}}
+
+# Add function runner
+COPY runner.py .
+
+# Set execute permissions
+RUN chmod +x runner.py
+
+# Run the function
+CMD ["python", "runner.py"]`
+
+	goDockerfileTemplate = `FROM --platform=linux/amd64 golang:1.18-alpine AS builder
+
+# Set TARGETARCH for multi-architecture build
+ARG TARGETARCH=amd64
+
+# Create app directory
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    git \
+    build-base
+
+# Copy function code and dependencies
+COPY . .
+
+# Debug: List files
+RUN ls -la
+
+# Initialize go module if not exists
+RUN if [ ! -f go.mod ]; then \
+        go mod init function; \
+    fi
+
+# Debug: Show go.mod content
+RUN cat go.mod
+
+# Download dependencies and build with explicit architecture
+RUN go mod tidy -v && \
+    go list -m all && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o function
+
+# Create final image
+FROM --platform=linux/amd64 alpine:latest
+WORKDIR /app
+COPY --from=builder /app/function .
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata
+
+# Set environment variables
+ENV FUNCTION_HANDLER={{.Handler}}
+
+# Run the function
+CMD ["./function"]`
+)
+
+// nodeRunnerScript is the JavaScript code that loads and runs the function
+const nodeRunnerScript = `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+
+// Debug logging
+console.log('Starting runner script');
+console.log('Working directory:', process.cwd());
+console.log('Files in current directory:', fs.readdirSync('.'));
+
+// Get the handler function
+const handlerPath = process.env.FUNCTION_HANDLER || 'index.handler';
+console.log('Handler path:', handlerPath);
+
+// Parse handler path
+let [moduleName, functionName] = handlerPath.split('.');
+if (!moduleName.endsWith('.js')) {
+  // If no .js extension, check if the file exists with .js
+  if (fs.existsSync(moduleName + '.js')) {
+    moduleName = moduleName + '.js';
+  }
+}
+console.log('Module:', moduleName, 'Function:', functionName);
+
+// Check if the module file exists
+try {
+  const stats = fs.statSync(moduleName);
+  console.log('Module file stats:', stats);
+} catch (err) {
+  console.error('Module file not found:', err.message);
+  console.log('Available files:', fs.readdirSync('.'));
+}
+
+// Process input
+async function processInput() {
+  try {
+    // Get input from environment
+    const inputStr = process.env.FUNCTION_INPUT || '{}';
+    console.log('Raw input:', inputStr);
+
+    let event;
+    try {
+      event = JSON.parse(inputStr);
+    } catch (e) {
+      console.error('Failed to parse input JSON:', e);
+      event = {};
+    }
+    
+    console.log('Parsed input:', JSON.stringify(event, null, 2));
+
+    // Load the handler module
+    console.log('Loading module from:', path.join(process.cwd(), moduleName));
+    
+    try {
+      // Remove .js extension for require
+      const requireName = moduleName.replace(/\.js$/, '');
+      console.log('Requiring module:', requireName);
+      
+      const handlerModule = require('./' + requireName);
+      
+      if (!handlerModule) {
+        throw new Error('Module not found: ' + requireName);
+      }
+      
+      console.log('Module loaded successfully');
+      console.log('Module exports:', Object.keys(handlerModule));
+      
+      const handler = handlerModule[functionName];
+      
+      if (typeof handler !== 'function') {
+        throw new Error('Handler is not a function: ' + functionName);
+      }
+      
+      // Execute handler
+      console.log('Executing handler...');
+      const result = await handler(event);
+      
+      // Print the result in multiple ways for logging and parsing
+      console.log('--- FUNCTION OUTPUT START ---');
+      console.log(JSON.stringify(result));
+      console.log('--- FUNCTION OUTPUT END ---');
+      
+      // Also print in a more human-readable format
+      console.log('Handler result:', JSON.stringify(result, null, 2));
+
+      // Format and output response for better parsing
+      const response = {
+        statusCode: 200,
+        body: result
+      };
+
+      // Output to stdout with special markers for easier extraction
+      console.log('Final response:', JSON.stringify(response));
+      
+      // Output in a special format that's easy to extract
+      console.log('--- FUNCTION OUTPUT ---');
+      console.log(JSON.stringify(result));
+      console.log('----------------------');
+      
+      // Print a final confirmation message
+      console.log('Function execution completed successfully');
+      
+    } catch (moduleError) {
+      console.error('Module or handler error:', moduleError);
+      console.error('Error stack:', moduleError.stack);
+      
+      // Output error in a special format for easy extraction
+      console.log('--- FUNCTION OUTPUT ---');
+      console.log(JSON.stringify({
+        error: moduleError.message || 'Function handler error'
+      }));
+      console.log('----------------------');
+      
+      // Also output in standard format for backward compatibility
+      console.log(JSON.stringify({
+        statusCode: 500,
+        body: {
+          error: moduleError.message || 'Function handler error'
+        }
+      }));
+      
+      // Exit with an error code
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error('Runner error:', error);
+    console.error('Error stack:', error.stack);
+    
+    // Output error in a special format
+    console.log('--- FUNCTION OUTPUT ---');
+    console.log(JSON.stringify({
+      error: error.message || 'Internal server error'
+    }));
+    console.log('----------------------');
+    
+    // Exit with an error code
+    process.exit(1);
+  }
+}
+
+// Execute the function
+processInput()
+  .catch(err => {
+    console.error('Unhandled error:', err);
+    console.error('Error stack:', err.stack);
+    process.exit(1);
+  });`
+
+// pythonRunnerScript is the Python code that loads and runs the function
+const pythonRunnerScript = `import os
+import sys
+import json
+import importlib
+import traceback
+from datetime import datetime, timezone
+
+def get_input():
+    """Get function input from environment or stdin."""
+    if 'FUNCTION_INPUT' in os.environ:
+        return json.loads(os.environ['FUNCTION_INPUT'])
+    
+    # Read from stdin
+    input_data = sys.stdin.read()
+    return json.loads(input_data) if input_data else {}
+
+def main():
+    try:
+        # Parse handler
+        handler = os.environ['FUNCTION_HANDLER']
+        module_name, function_name = handler.rsplit('.', 1)
+
+        # Import the module
+        module = importlib.import_module(module_name)
+        fn = getattr(module, function_name)
+
+        # Prepare context
+        context = {
+            'function_name': os.environ.get('FUNCTION_NAME'),
+            'function_version': os.environ.get('FUNCTION_VERSION'),
+            'request_id': os.environ.get('REQUEST_ID'),
+            'deadline': datetime.fromtimestamp(
+                int(os.environ.get('DEADLINE', int(datetime.now(timezone.utc).timestamp()) + 300)),
+                timezone.utc
+            ),
+        }
+
+        # Get input and execute function
+        event = get_input()
+        result = fn(event, context)
+        
+        # Print result as JSON
+        print(json.dumps(result))
+    except Exception as e:
+        print(traceback.format_exc(), file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()`
+
+// createBuildContext creates a tar archive containing the function code and Dockerfile
+func createBuildContext(opts *BuildImageOptions) (io.Reader, error) {
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+	defer tw.Close()
+
+	// If the code path is an S3 path, download it first
+	if strings.HasPrefix(opts.CodePath, "s3://") {
+		if opts.S3Client == nil {
+			return nil, fmt.Errorf("S3 client is required for S3 code paths")
+		}
+
+		key := strings.TrimPrefix(opts.CodePath, fmt.Sprintf("s3://%s/", opts.S3Bucket))
+		codeData, err := opts.S3Client.DownloadFile(context.Background(), key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download code from S3: %w", err)
+		}
+
+		// Create a temporary directory
+		tmpDir, err := os.MkdirTemp("", "function-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp directory: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		// Write the zip file
+		zipPath := filepath.Join(tmpDir, "function.zip")
+		if err := os.WriteFile(zipPath, codeData, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write zip file: %w", err)
+		}
+
+		// Extract the zip file
+		if err := extractZip(zipPath, tmpDir); err != nil {
+			return nil, fmt.Errorf("failed to extract zip file: %w", err)
+		}
+
+		// Add all files to tar
+		if err := addDirToTar(tw, tmpDir, ""); err != nil {
+			return nil, fmt.Errorf("failed to add files to build context: %w", err)
+		}
+	}
+
+	// Generate and add Dockerfile
+	dockerfile, err := generateDockerfile(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate Dockerfile: %w", err)
+	}
+	fmt.Printf("Generated Dockerfile:\n%s\n", dockerfile)
+
+	if err := addFileToTar(tw, "Dockerfile", dockerfile); err != nil {
+		return nil, fmt.Errorf("failed to add Dockerfile to build context: %w", err)
+	}
+
+	// Add appropriate runner script
+	runnerScript, err := getRunnerScript(opts.Runtime)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get runner script: %w", err)
+	}
+
+	runnerFilename := getRunnerFilename(opts.Runtime)
+	if err := addFileToTar(tw, runnerFilename, runnerScript); err != nil {
+		return nil, fmt.Errorf("failed to add runner script to build context: %w", err)
+	}
+
+	// Get Docker Hub auth - skip this step as we don't need it for ECR
+	// authConfig, _, err := getDockerHubAuthForBuild()
+	// if err != nil {
+	// 	return "", fmt.Errorf("failed to get Docker Hub auth: %w", err)
+	// }
+
+	// Don't format base image name - use official images directly
+	// if strings.Contains(def.BaseImage, "docker.io/") {
+	// 	def.BaseImage = fmt.Sprintf("%s/%s", authConfig.Username, def.BaseImage)
+	// }
+
+	return buf, nil
+}
+
+// Helper function to extract zip file
+func extractZip(zipPath, destPath string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(destPath, f.Name)
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Helper function to add directory to tar
+func addDirToTar(tw *tar.Writer, dir, prefix string) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Get the relative path
+		relPath, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+
+		// Skip if it's the base directory
+		if relPath == "." {
+			return nil
+		}
+
+		// Create tar header
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+
+		// Update header name with prefix and relative path
+		header.Name = filepath.Join(prefix, relPath)
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		// If it's a regular file, write the content
+		if info.Mode().IsRegular() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			if _, err := io.Copy(tw, file); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
+// generateDockerfile generates a Dockerfile for the specified runtime
+func generateDockerfile(opts *BuildImageOptions) (string, error) {
+	def, ok := runtimeDefinitions[opts.Runtime]
+	if !ok {
+		return "", fmt.Errorf("unsupported runtime: %s", opts.Runtime)
+	}
+
+	var tmpl *template.Template
+	switch opts.Runtime {
+	case models.RuntimeNodeJS14, models.RuntimeNodeJS16, models.RuntimeNodeJS18:
+		tmpl = template.Must(template.New("dockerfile").Parse(nodeDockerfileTemplate))
+	case models.RuntimePython38, models.RuntimePython39, models.RuntimePython310:
+		tmpl = template.Must(template.New("dockerfile").Parse(pythonDockerfileTemplate))
+	case models.RuntimeGo116, models.RuntimeGo117, models.RuntimeGo118:
+		tmpl = template.Must(template.New("dockerfile").Parse(goDockerfileTemplate))
+	default:
+		return "", fmt.Errorf("no Dockerfile template for runtime: %s", opts.Runtime)
+	}
+
+	data := struct {
+		BaseImage   string
+		PreInstall  []string
+		Handler     string
+		BuildScript string
+	}{
+		BaseImage:   def.BaseImage,
+		PreInstall:  def.PreInstall,
+		Handler:     opts.Handler,
+		BuildScript: def.BuildScript,
+	}
+
+	// Get Docker Hub auth - skip this step as we don't need it for ECR
+	// authConfig, _, err := getDockerHubAuthForBuild()
+	// if err != nil {
+	// 	return "", fmt.Errorf("failed to get Docker Hub auth: %w", err)
+	// }
+
+	// Don't format base image name - use official images directly
+	// if strings.Contains(def.BaseImage, "docker.io/") {
+	// 	def.BaseImage = fmt.Sprintf("%s/%s", authConfig.Username, def.BaseImage)
+	// }
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute Dockerfile template: %w", err)
+	}
+
+	return buf.String(), nil
+}
+
+// getRunnerScript returns the appropriate runner script for the runtime
+func getRunnerScript(runtime models.Runtime) (string, error) {
+	switch runtime {
+	case models.RuntimeNodeJS14, models.RuntimeNodeJS16, models.RuntimeNodeJS18:
+		return nodeRunnerScript, nil
+	case models.RuntimePython38, models.RuntimePython39, models.RuntimePython310:
+		return pythonRunnerScript, nil
+	case models.RuntimeGo116, models.RuntimeGo117, models.RuntimeGo118:
+		return "", nil // Go doesn't need a runner script
+	default:
+		return "", fmt.Errorf("no runner script for runtime: %s", runtime)
+	}
+}
+
+// getRunnerFilename returns the appropriate filename for the runner script
+func getRunnerFilename(runtime models.Runtime) string {
+	switch runtime {
+	case models.RuntimeNodeJS14, models.RuntimeNodeJS16, models.RuntimeNodeJS18:
+		return "runner.js"
+	case models.RuntimePython38, models.RuntimePython39, models.RuntimePython310:
+		return "runner.py"
+	default:
+		return ""
+	}
+}
+
+// addToTar adds a file or directory to a tar archive
+func addToTar(tw *tar.Writer, path, prefix string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			entryPath := filepath.Join(path, entry.Name())
+			entryPrefix := filepath.Join(prefix, entry.Name())
+			if err := addToTar(tw, entryPath, entryPrefix); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Create tar header
+	header := &tar.Header{
+		Name:    filepath.Join(prefix, filepath.Base(path)),
+		Size:    info.Size(),
+		Mode:    int64(info.Mode()),
+		ModTime: info.ModTime(),
+	}
+
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(tw, file); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// addFileToTar adds a file with the given content to a tar archive
+func addFileToTar(tw *tar.Writer, name string, content string) error {
+	header := &tar.Header{
+		Name:    name,
+		Size:    int64(len(content)),
+		Mode:    0644,
+		ModTime: time.Now(),
+	}
+
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	if _, err := io.WriteString(tw, content); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// addBytesToTar adds a byte slice to a tar archive
+func addBytesToTar(tw *tar.Writer, name string, data []byte) error {
+	header := &tar.Header{
+		Name:    name,
+		Size:    int64(len(data)),
+		Mode:    0644,
+		ModTime: time.Now(),
+	}
+
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	if _, err := tw.Write(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// goRunnerScript is the Go code that loads and runs the function
+const goRunnerScript = `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+func main() {
+	// Read input from environment or stdin
+	var input map[string]interface{}
+	if inputStr := os.Getenv("FUNCTION_INPUT"); inputStr != "" {
+		if err := json.Unmarshal([]byte(inputStr), &input); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing input: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Extract payload
+	if payload, ok := input["payload"]; ok {
+		input = payload.(map[string]interface{})
+	}
+
+	// Execute handler
+	result, err := Handler(input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing handler: %v\n", err)
+		json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+			"statusCode": 500,
+			"body": map[string]interface{}{
+				"error": err.Error(),
+			},
+		})
+		os.Exit(1)
+	}
+
+	// Write result
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding result: %v\n", err)
+		os.Exit(1)
+	}
+}`
+
+// getDockerHubAuthForBuild returns the Docker Hub authentication configuration for the build process
+func getDockerHubAuthForBuild() (types.AuthConfig, string, error) {
+	username := os.Getenv("DOCKERHUB_USERNAME")
+	password := os.Getenv("DOCKERHUB_PASSWORD")
+
+	// If Docker Hub credentials are missing, use an empty auth config
+	// This will allow us to use ECR instead of Docker Hub
+	if username == "" || password == "" {
+		// Use a default username to prevent errors
+		username = "library"
+
+		// Return empty auth config which won't be used for push
+		return types.AuthConfig{
+			Username:      username,
+			ServerAddress: "https://index.docker.io/v1/",
+		}, "", nil
+	}
+
+	// Format username
+	username = strings.ReplaceAll(username, "@", "")
+	username = strings.ToLower(username)
+
+	// Create auth config
+	authConfig := types.AuthConfig{
+		Username:      username,
+		Password:      password,
+		ServerAddress: "https://index.docker.io/v1/",
+	}
+
+	// Encode auth config for push operation
+	encodedJSON, err := json.Marshal(authConfig)
+	if err != nil {
+		return authConfig, "", err
+	}
+
+	return authConfig, base64.URLEncoding.EncodeToString(encodedJSON), nil
+}

@@ -1,0 +1,19 @@
+--- internal/docker/build.go
++++ internal/docker/build.go
+@@ -720,6 +720,16 @@ func getDockerHubAuthForBuild() (types.AuthConfig, string, error) {
+ 	return auth, authString, nil
+ }
+ 
++// nodeEntrypointScript is the Docker entrypoint script for Node.js runtimes
++const nodeEntrypointScript = `#!/bin/sh
++set -e
++
++# First arg is node or npm
++if [ "${1#-}" != "${1}" ] || [ -z "$(command -v "${1}")" ]; then
++  set -- node "$@"
++fi
++
++exec "$@"`
+ 
+ 
+ 

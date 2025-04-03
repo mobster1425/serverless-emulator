@@ -1,0 +1,37 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      docker: 20
+  
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI
+      - FUNCTION_ID=$(cat function_id.txt)
+      - FUNCTION_RUNTIME=$(cat function_runtime.txt)
+      - FUNCTION_HANDLER=$(cat function_handler.txt)
+  
+  build:
+    commands:
+      - echo Building the Docker image...
+      - docker build --platform linux/amd64 --build-arg TARGETPLATFORM=linux/amd64 --build-arg TARGETARCH=amd64 --build-arg BUILDPLATFORM=linux/amd64 --build-arg FUNCTION_HANDLER=$FUNCTION_HANDLER -t $ECR_REPOSITORY_URI:$FUNCTION_ID .
+  
+  post_build:
+    commands:
+      - echo Pushing the Docker image...
+      - docker push $ECR_REPOSITORY_URI:$FUNCTION_ID
+      - echo Writing image URI to output...
+      - echo "{\"imageUri\":\"$ECR_REPOSITORY_URI:$FUNCTION_ID\"}" > imageDetail.json
+
+artifacts:
+  files:
+    - imageDetail.json
+    - function_id.txt
+    - function_runtime.txt
+    - function_handler.txt
+
+cache:
+  paths:
+    - /root/.docker/**/* 
