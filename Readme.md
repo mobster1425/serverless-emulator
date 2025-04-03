@@ -328,8 +328,6 @@ serverless-emulator/
 # Build the server
 go build -o bin/server ./cmd/server
 
-# Run tests
-go test ./...
 ```
 
 ## License
