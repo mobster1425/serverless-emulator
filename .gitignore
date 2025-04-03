@@ -1,0 +1,75 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.db
+bin/
+debug
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Frontend directory
+/frontend/
+/frontend/*
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Temporary files
+*~
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Build files
+build/
+dist/
+*.zip
+
+# Log files
+*.log
+logs/
+
+# AWS credentials and config
+.aws/
+
+# Local development files
+local/
+
+# Docker volumes
+docker-volumes/
+
+# Serverless emulator specific
+function-code/
+docker-network/
